@@ -301,17 +301,22 @@ class GPTModel(GPTPreTrainedModel):
         if self.process_group is not None:
             sync_shared_params(self, self.process_group)
 
-    def forward(self, input_ids, position_ids=None, inference_params=None):
+    def forward(self, input_ids, inputs_embeds=None, position_ids=None, inference_params=None):
         # If using Tensor Parallel with sequence parallel, we combine the batch and the seqlen
         # dimensions so that we can split on it easily, in case of small batch size.
         # Only the attention layers need to know the seqlen.
         embedding_kwargs = ({'combine_batch_seqlen_dim': True}
                             if self.process_group is not None and self.sequence_parallel else {})
-        hidden_states = self.embeddings(input_ids, position_ids=position_ids, **embedding_kwargs)
+        if inputs_embeds is None:
+            hidden_states = self.embeddings(input_ids, position_ids=position_ids, **embedding_kwargs)
+            seqlen = input_ids.shape[1]
+        else:
+            hidden_states = inputs_embeds
+            seqlen = inputs_embeds.shape[1]
         if self.parallel_block:
             hidden_states2 = None
         residual = None
-        mixer_kwargs = ({'seqlen': input_ids.shape[1]}
+        mixer_kwargs = ({'seqlen': seqlen}
                         if self.process_group is not None and self.sequence_parallel else {})
         if inference_params is not None:
             mixer_kwargs['inference_params'] = inference_params
@@ -386,12 +391,13 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         if self.process_group is not None:
             sync_shared_params(self, self.process_group)
 
-    def forward(self, input_ids, position_ids=None, inference_params=None):
+    def forward(self, input_ids, inputs_embeds=None, position_ids=None, inference_params=None):
         """
             inference_params: for generation. Adapted from Megatron-LM (and Apex)
             https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
         """
-        hidden_states = self.transformer(input_ids, position_ids=position_ids,
+        hidden_states = self.transformer(input_ids, inputs_embeds=inputs_embeds,
+                                         position_ids=position_ids,
                                          inference_params=inference_params)
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)
@@ -400,8 +406,8 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         if isinstance(self.lm_head, ColumnParallelLinear) and inference_params is not None:
             lm_logits, _ = all_gather_raw(lm_logits, self.lm_head.process_group)
             lm_logits = rearrange(lm_logits, '(n b) s d -> b s (n d)', b=hidden_states.shape[0])
-        CausalLMOutput = namedtuple('CausalLMOutput', ['logits'])
-        return CausalLMOutput(logits=lm_logits)
+        CausalLMOutput = namedtuple('CausalLMOutput', ['logits', 'hidden_states'])
+        return CausalLMOutput(logits=lm_logits, hidden_states=hidden_states)
 
     def load_state_dict(self, state_dict, strict=True):
         # Remapping from our checkpoints that used a different ordering of layers in the block
